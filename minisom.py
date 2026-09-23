@@ -3,7 +3,7 @@ from numpy import (array, unravel_index, nditer, linalg, random, subtract, max,
                    logical_and, mean, cov, argsort, linspace, float64,
                    einsum, prod, nan, sqrt, hstack, diff, argmin, multiply,
                    nanmean, nansum, tile, array_equal, isclose, maximum,
-                   zeros_like, where, newaxis)
+                   zeros_like, where, newaxis, isnan, nanmax)
 from numpy.linalg import norm
 from collections import defaultdict, Counter
 from warnings import warn
@@ -112,7 +112,7 @@ try:
         n_x, n_y, n_features = weights.shape
         n_samples = data.shape[0]
         numerator = zeros((n_x, n_y, n_features))
-        denominator = zeros((n_x, n_y))
+        denominator = zeros((n_x, n_y, n_features))
         xx_T = xx.T
         yy_T = yy.T
 
@@ -128,6 +128,8 @@ try:
                     if distance_type == 0:  # euclidean
                         d = 0.0
                         for f in range(n_features):
+                            if sample[f] != sample[f]:
+                                continue
                             d += (sample[f] - weights[i, j, f]) ** 2
                         d = sqrt(d)
                     elif distance_type == 1:  # cosine
@@ -135,6 +137,8 @@ try:
                         norm_w = 0.0
                         norm_s = 0.0
                         for f in range(n_features):
+                            if sample[f] != sample[f]:
+                                continue
                             dot_sw += weights[i, j, f] * sample[f]
                             norm_w += weights[i, j, f] ** 2
                             norm_s += sample[f] ** 2
@@ -143,6 +147,8 @@ try:
                     elif distance_type == 2:  # manhattan
                         d = 0.0
                         for f in range(n_features):
+                            if sample[f] != sample[f]:
+                                continue
                             diff_val = sample[f] - weights[i, j, f]
                             if diff_val < 0:
                                 d -= diff_val
@@ -151,6 +157,8 @@ try:
                     else:  # chebyshev
                         d = -1e308
                         for f in range(n_features):
+                            if sample[f] != sample[f]:
+                                continue
                             diff_val = sample[f] - weights[i, j, f]
                             if diff_val > d:
                                 d = diff_val
@@ -170,9 +178,10 @@ try:
                         ax = exp(-(xx[j, i] - cx) ** 2 / d2)
                         ay = exp(-(yy[j, i] - cy) ** 2 / d2)
                         g_val = ax * ay
-                        denominator[i, j] += g_val
                         for f in range(n_features):
-                            numerator[i, j, f] += g_val * sample[f]
+                            if sample[f] == sample[f]:
+                                numerator[i, j, f] += g_val * sample[f]
+                                denominator[i, j, f] += g_val
             elif neighborhood_type == 1:  # mexican_hat
                 d2 = 2.0 * sigma * sigma
                 cx = xx_T[bmu_x, bmu_y]
@@ -182,9 +191,10 @@ try:
                         p = ((xx[j, i] - cx) ** 2 +
                              (yy[j, i] - cy) ** 2)
                         g_val = exp(-p / d2) * (1.0 - 2.0 / d2 * p)
-                        denominator[i, j] += g_val
                         for f in range(n_features):
-                            numerator[i, j, f] += g_val * sample[f]
+                            if sample[f] == sample[f]:
+                                numerator[i, j, f] += g_val * sample[f]
+                                denominator[i, j, f] += g_val
             elif neighborhood_type == 2:  # bubble
                 for i in range(n_x):
                     if neigx[i] > bmu_x - sigma and \
@@ -192,9 +202,10 @@ try:
                         for j in range(n_y):
                             if neigy[j] > bmu_y - sigma and \
                                neigy[j] < bmu_y + sigma:
-                                denominator[i, j] += 1.0
                                 for f in range(n_features):
-                                    numerator[i, j, f] += sample[f]
+                                    if sample[f] == sample[f]:
+                                        numerator[i, j, f] += sample[f]
+                                        denominator[i, j, f] += 1.0
             else:  # triangle
                 for i in range(n_x):
                     tx = (-abs(bmu_x - neigx[i])) + sigma
@@ -206,9 +217,10 @@ try:
                             ty = 0.0
                         g_val = tx * ty
                         if g_val > 0.0:
-                            denominator[i, j] += g_val
                             for f in range(n_features):
-                                numerator[i, j, f] += g_val * sample[f]
+                                if sample[f] == sample[f]:
+                                    numerator[i, j, f] += g_val * sample[f]
+                                    denominator[i, j, f] += g_val
 
         return numerator, denominator
 
@@ -494,18 +506,20 @@ class MiniSom(object):
         return outer(triangle_x, triangle_y)
 
     def _cosine_distance(self, x, w):
-        num = (w * x).sum(axis=2)
-        denum = multiply(linalg.norm(w, axis=2), linalg.norm(x))
+        valid = ~isnan(x)
+        num = nansum(where(valid, w * x, nan), axis=2)
+        denum = multiply(linalg.norm(where(valid, w, 0), axis=2),
+                          linalg.norm(where(valid, x, 0)))
         return 1 - num / (denum+1e-8)
 
     def _euclidean_distance(self, x, w):
-        return linalg.norm(subtract(x, w), axis=-1)
+        return sqrt(nansum((x - w) ** 2, axis=-1))
 
     def _manhattan_distance(self, x, w):
-        return linalg.norm(subtract(x, w), ord=1, axis=-1)
+        return nansum(abs(x - w), axis=-1)
 
     def _chebyshev_distance(self, x, w):
-        return max(subtract(x, w), axis=-1)
+        return nanmax(subtract(x, w), axis=-1)
 
     def _check_iteration_number(self, num_iteration):
         if num_iteration < 1:
@@ -548,7 +562,8 @@ class MiniSom(object):
         # improves the performances
         g = self.neighborhood(win, sig)*eta
         # w_new = eta * neighborhood_function * (x-w)
-        self._weights += einsum('ij, ijk->ijk', g, x-self._weights)
+        diff = where(isnan(x), 0, x-self._weights)
+        self._weights += einsum('ij, ijk->ijk', g, diff)
 
     def quantization(self, data):
         """Assigns a code book (weights vector of the winning neuron)
@@ -565,7 +580,10 @@ class MiniSom(object):
         it = nditer(self._activation_map, flags=['multi_index'])
         while not it.finished:
             rand_i = self._random_generator.randint(len(data))
-            self._weights[it.multi_index] = data[rand_i]
+            sample = array(data[rand_i], dtype=float64)
+            sample[isnan(sample)] = nanmean(array(data, dtype=float64),
+                                            axis=0)[isnan(sample)]
+            self._weights[it.multi_index] = sample
             it.iternext()
 
     def pca_weights_init(self, data):
@@ -581,6 +599,8 @@ class MiniSom(object):
             msg = 'The data needs at least 2 features for pca initialization'
             raise ValueError(msg)
         self._check_input_len(data)
+        data = array(data, dtype=float64)
+        data = where(isnan(data), nanmean(data, axis=0), data)
         if len(self._neigx) == 1 or len(self._neigy) == 1:
             msg = 'PCA initialization inappropriate:' + \
                   'One of the dimensions of the map is 1.'
@@ -755,8 +775,7 @@ class MiniSom(object):
 
             # Initialize accumulators
             numerator = zeros_like(self._weights)
-            denominator = zeros((self._weights.shape[0],
-                                 self._weights.shape[1]))
+            denominator = zeros_like(self._weights)
 
             # Process all samples
             for sample in data:
@@ -764,13 +783,12 @@ class MiniSom(object):
                 g = self.neighborhood(bmu, sigma)
                 # Vectorized accumulation
                 g_expanded = g[:, :, newaxis]
-                numerator += g_expanded * sample
-                denominator += g
+                valid = ~isnan(sample)
+                numerator += g_expanded * where(valid, sample, 0)
+                denominator += g_expanded * valid
 
             # Batch update with safety check
-            denominator_safe = where(denominator[:, :, newaxis] > 0,
-                                     denominator[:, :, newaxis],
-                                     1.0)
+            denominator_safe = where(denominator > 0, denominator, 1.0)
 
             # Weighted average update
             new_weights = numerator / denominator_safe
@@ -860,9 +878,7 @@ class MiniSom(object):
                 self._neigy.astype(float64),
                 sigma, neighborhood_type, distance_type)
 
-            denominator_safe = where(denominator[:, :, newaxis] > 0,
-                                     denominator[:, :, newaxis],
-                                     1.0)
+            denominator_safe = where(denominator > 0, denominator, 1.0)
             new_weights = numerator / denominator_safe
             mask = denominator > 0
             self._weights[mask] = \
@@ -936,21 +952,25 @@ class MiniSom(object):
         """
         input_data = array(data)
         weights_flat = self._weights.reshape(-1, self._weights.shape[2])
-        input_data_sq = power(input_data, 2).sum(axis=1, keepdims=True)
-        weights_flat_sq = power(weights_flat, 2).sum(axis=1, keepdims=True)
-        cross_term = dot(input_data, weights_flat.T)
+        input_data_sq = nansum(power(input_data, 2), axis=1, keepdims=True)
+        weights_flat_sq = nansum(
+            where(isnan(input_data[:, newaxis, :]), 0,
+                  power(weights_flat, 2)), axis=2)
+        cross_term = nansum(
+            input_data[:, newaxis, :] * weights_flat[newaxis, :, :], axis=2)
         # this subtracs nearly equal, relatively large terms to get a small
         # residual and can be affected by rounding errors. Clipping negative
         # values using maximum mitigates this issue.
         return sqrt(
-            maximum(0, -2 * cross_term + input_data_sq + weights_flat_sq.T)
+            maximum(0, -2 * cross_term + input_data_sq + weights_flat_sq)
         )
 
     def quantization_error(self, data):
         """Returns the quantization error computed as the average
         distance between each input sample and its best matching unit."""
         self._check_input_len(data)
-        return norm(data-self.quantization(data), axis=1).mean()
+        return sqrt(nansum((array(data)-self.quantization(data)) ** 2,
+                           axis=1)).mean()
 
     def distortion_measure(self, data):
         """Returns the distortion measure computed as
@@ -960,7 +980,8 @@ class MiniSom(object):
         for d in data:
             distortion += multiply(self.neighborhood(self.winner(d),
                                                      self._sigma),
-                                   norm(d - self.get_weights(), axis=2)).sum()
+                                   sqrt(nansum((d - self.get_weights()) ** 2,
+                                               axis=2))).sum()
         return distortion
 
     def topographic_error(self, data):
@@ -1404,6 +1425,16 @@ class TestMinisom(unittest.TestCase):
         q1 = som.quantization_error(data)
         som.train_batch_offline(data, 10)
         assert q1 > som.quantization_error(data)
+
+    def test_nan_inputs(self):
+        data = array([[4.0, nan], [nan, 1.0], [3.0, 2.0]])
+        for train in (lambda som: som.train(data, 3),
+                      lambda som: som.train_batch_offline(data, 2),
+                      lambda som: som.train_batch_offline_fast(data, 2)):
+            som = MiniSom(3, 3, 2, random_seed=1)
+            train(som)
+            assert not isnan(som.get_weights()).any()
+            assert not isnan(som.quantization(data)).any()
         data = array([[1, 5], [6, 7]])
         q1 = som.quantization_error(data)
         som.train_batch_offline(data, 10, verbose=True)
@@ -1557,7 +1588,7 @@ class TestMinisom(unittest.TestCase):
             som._neigy.astype(float64),
             1.0, 0, 0)
         assert numerator.shape == som._weights.shape
-        assert denominator.shape == (5, 5)
+        assert denominator.shape == som._weights.shape
         # All samples contribute, so denominator should be positive
         assert (denominator > 0).all()
         # Numerator should not be all zeros
